@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 Created on Sat Sep 21 13:49:40 2019
-
 @author: will
 """
 import matplotlib.pyplot as plt
@@ -15,60 +14,69 @@ from torch.nn.utils import clip_grad_value_
 import numpy as np
 import time
 import copy
-from segmentation_models_pytorch.base.encoder_decoder import EncoderDecoder
+#from segmentation_models_pytorch.base.encoder_decoder import EncoderDecoder
 from efficientnet_pytorch import EfficientNet
 from efficientnet_pytorch.utils import relu_fn,load_pretrained_weights,get_model_params,drop_connect,get_same_padding_conv2d
-
+from segmentation_models_pytorch.utils.losses import BCEDiceLoss
+from apex import amp
 
 '''------------------------------------------------------------------------------------------------------------------'''
 '''------------------------------------------------------ Data -----------------------------------------------------'''
 '''------------------------------------------------------------------------------------------------------------------'''
 
 preprocessing_dict = {256:(0.5506135154400696, 0.25807634194916107)}
-encoder_c = {'efficientnet-b2':(352,120,48,24,16)}
 
-class dataset_old(Dataset):
-    # this load all images once. does not work for 1024*1024
-    def __init__(self, images,masks,augmentation=None,preprocessing=None):
-        # preprocessing should be a tuple (mean,std) used to normalize image
-        self.images = images
-        self.masks = masks
-        self.augmentation = augmentation
-        self.preprocessing = preprocessing
+encoder_channels={'efficientnet-b0': [320, 112, 40, 24, 16],
+                  'efficientnet-b1': [320, 112, 40, 24, 16],
+                  'efficientnet-b2': [352, 120, 48, 24, 16],
+                  'efficientnet-b3': [384, 136, 48, 32, 24],
+                  'efficientnet-b4': [448, 160, 56, 32, 24],
+                  'efficientnet-b5': [512, 176, 64, 40, 24],
+                  'efficientnet-b6': [576, 200, 72, 40, 32],
+                  'efficientnet-b7': [640, 224, 80, 48, 32]}
+
+# class dataset_old(Dataset):
+#     # this load all images once. does not work for 1024*1024
+#     def __init__(self, images,masks,augmentation=None,preprocessing=None):
+#         # preprocessing should be a tuple (mean,std) used to normalize image
+#         self.images = images
+#         self.masks = masks
+#         self.augmentation = augmentation
+#         self.preprocessing = preprocessing
     
-    def _cal_preprocessing(self):
-        n = len(self)
-        mean,std = 0,0
-        for i in range(n):
-            image = self.images[i]
-            image = self.augmentation(image=image)['image']
-            mean = mean + image.mean()
-            std = std + (image**2).mean()
-        mean = mean/n
-        std = np.sqrt(std/n-mean**2)
-        self.preprocessing = mean,std
-        print(mean,std)
+#     def _cal_preprocessing(self):
+#         n = len(self)
+#         mean,std = 0,0
+#         for i in range(n):
+#             image = self.images[i]
+#             image = self.augmentation(image=image)['image']
+#             mean = mean + image.mean()
+#             std = std + (image**2).mean()
+#         mean = mean/n
+#         std = np.sqrt(std/n-mean**2)
+#         self.preprocessing = mean,std
+#         print(mean,std)
     
-    def __getitem__(self, i):
-        image = self.images[i]
-        mask = self.masks[i]
+#     def __getitem__(self, i):
+#         image = self.images[i]
+#         mask = self.masks[i]
         
-        # apply augmentations
-        if self.augmentation:
-            sample = self.augmentation(image=image, mask=mask)
-            image, mask = sample['image'], sample['mask']
+#         # apply augmentations
+#         if self.augmentation:
+#             sample = self.augmentation(image=image, mask=mask)
+#             image, mask = sample['image'], sample['mask']
         
-        # apply preprocessing
-        if self.preprocessing:
-            image = (image-self.preprocessing[0])/self.preprocessing[1]
+#         # apply preprocessing
+#         if self.preprocessing:
+#             image = (image-self.preprocessing[0])/self.preprocessing[1]
             
-        return image[None], mask[None]
+#         return image[None], mask[None]
         
-    def __len__(self):
-        return self.images.shape[0]
+#     def __len__(self):
+#         return self.images.shape[0]
 
 class dataset(Dataset):
-    def __init__(self, imageId,images_dir,masks_dir,augmentation=None,preprocessing=None):
+    def __init__(self, imageId,images_dir,masks_dir=None,augmentation=None,preprocessing=None):
         # preprocessing should be a tuple (mean,std) used to normalize image
         self.imageId = imageId
         self.images_dir = images_dir
@@ -93,17 +101,23 @@ class dataset(Dataset):
         image = np.load(self.images_dir+self.imageId[i]+'.npy')
         if self.masks_dir is not None:
             mask = np.load(self.masks_dir+self.imageId[i]+'.npy')
-        
-        # apply augmentations
-        if self.augmentation:
-            sample = self.augmentation(image=image, mask=mask)
-            image, mask = sample['image'], sample['mask']
-        
-        # apply preprocessing
-        if self.preprocessing:
-            image = (image-self.preprocessing[0])/self.preprocessing[1]
-            
-        return image[None], mask[None]
+            # apply augmentations
+            if self.augmentation:            
+                sample = self.augmentation(image=image, mask=mask)
+                image, mask = sample['image'], sample['mask']
+            # apply preprocessing
+            if self.preprocessing:
+                image = (image-self.preprocessing[0])/self.preprocessing[1]
+            return image[None], mask[None]
+        else:
+            # apply augmentations
+            if self.augmentation:            
+                sample = self.augmentation(image=image)
+                image = sample['image']
+            # apply preprocessing
+            if self.preprocessing:
+                image = (image-self.preprocessing[0])/self.preprocessing[1]
+            return image[None],     
         
     def __len__(self):
         return len(self.imageId)
@@ -173,7 +187,6 @@ class EfficientNet_encoder(EfficientNet):
 class MBConvBlock(nn.Module):
     """
     remove block_args (namedtuple): and global_params (namedtuple)
-
     """
     def __init__(self,input_filters,output_filters,image_size,expand_ratio,
                  kernel_size=3,stride=1,has_se=True,id_skip=True,se_ratio=0.25):
@@ -261,8 +274,7 @@ class EfficientNet_decoder(nn.Module):
             expand_ratio=6,
             decoder_channels=(256, 128, 64, 32, 16),
             decoder_repeats=(2,2,2,2,2),
-            final_channels=1,
-            use_batchnorm=True,
+            final_channels=1
     ):
         super().__init__()
 
@@ -316,28 +328,40 @@ class EfficientNet_decoder(nn.Module):
 
 
 class Unet(nn.Module):
-    def __init__(self, encoder, decoder):
+    def __init__(self, encoder, decoder,activation='sigmoid'):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
-        # TODO: add activation
-#        if callable(activation):
-#            self.activation = activation
-#        elif activation == 'softmax':
-#            self.activation = nn.Softmax(dim=1)
-#        elif activation == 'sigmoid':
-#            self.activation = nn.Sigmoid()
-#        else:
-#            raise ValueError('Activation should be "sigmoid" or "softmax"')
+        self.loss = BCEDiceLoss(activation=activation)
+        
+        if callable(activation):
+            self.activation = activation
+        elif activation == 'softmax':
+            self.activation = nn.Softmax(dim=1)
+        elif activation == 'sigmoid':
+            self.activation = nn.Sigmoid()
+        else:
+            raise ValueError('Activation should be "sigmoid" or "softmax"')
             
-    def forward(self, x,mask=None):
+    def forward(self,x,mask=None):
         x = x.expand(-1,3,-1,-1) # gray to RGB
         x = self.encoder(x)
-        out = self.decoder(x)
-        # TODO: mask not None, return loss
-        return out
+        x = self.decoder(x)
+        if mask is not None:
+            return self.loss(x,mask)
+        else:
+            return x
 
-
+    def predict(self,x,threshold=None):
+        """Inference method. """
+        with torch.no_grad():
+            x = self.forward(x)
+            if self.activation:
+                x = self.activation(x)
+            if threshold is not None:
+                x = (x > threshold).float()
+        return x
+    
 '''------------------------------------------------------------------------------------------------------------------'''
 '''----------------------------------------------------- utility -----------------------------------------------------'''
 '''------------------------------------------------------------------------------------------------------------------'''
@@ -346,75 +370,70 @@ def visualize(image,mask):
     plt.imshow(image)
     plt.imshow(mask,alpha=0.5)
 
-def train_type(opt,model,epochs,train_dl,val_dl,paras,clip,\
-               scheduler=None,logLoss=True,weight=None,patience=6,saveModelEpoch=50):
+def train(opt,model,epochs,train_dl,val_dl,paras,clip,\
+          scheduler=None,patience=6,saveModelEpoch=20):
     # add early stop for 5 fold
     since = time.time()
     counter = 0 
-    lossBest = np.ones(8)*1e6
-    bestWeight = [None] * 8
-    bestOpt = [None] * 8
+    lossBest = 1e6
+    bestWeight = None
+    bestOpt = None
         
     opt.zero_grad()
     for epoch in range(epochs):
         # training #
         model.train()
-        np.random.seed()
         train_loss = 0
-        train_loss_perType = np.zeros(8)
         val_loss = 0
-        val_loss_perType = np.zeros(8)
         
         for i,data in enumerate(train_dl):
             data = [out.to('cuda:0') for out in data]
-            loss,loss_perType = model(*data)
-            loss.backward()
-            clip_grad_value_(paras,clip)
+            loss = model(*data)
+            with amp.scale_loss(loss, opt) as scaled_loss:
+                scaled_loss.backward()
+            clip_grad_value_(amp.master_params(opt),clip)
             opt.step()
             opt.zero_grad()
             train_loss += loss.item()
-            train_loss_perType += loss_perType.cpu().detach().numpy()
-            
+        train_loss = train_loss/i
+        
         # evaluating #
         model.eval()
         with torch.no_grad():
-            for j,(out,mask,edge,y) in enumerate(val_dl):
-                out,mask,edge,y = out.to('cuda:0'),mask.to('cuda:0'),edge.to('cuda:0'),y.to('cuda:0')
-                loss,loss_perType = model(out,mask,edge,y,True)
+            for j,data in enumerate(val_dl):
+                data = [out.to('cuda:0') for out in data]
+                loss = model(*data)
                 val_loss += loss.item()
-                val_loss_perType += loss_perType.cpu().detach().numpy()
         val_loss = val_loss/j
         
         # save model
-        val_loss_perType = val_loss_perType/j
-        for index_ in range(8):
-            if val_loss_perType[index_]<lossBest[index_]:
-                lossBest[index_] = val_loss_perType[index_]
-                if epoch>saveModelEpoch:
-                    bestWeight[index_] = copy.deepcopy(model.state_dict())
-                    bestOpt[index_] = copy.deepcopy(opt.state_dict())
+        if val_loss<lossBest:
+            lossBest = val_loss
+            if epoch>saveModelEpoch:
+                bestWeight = copy.deepcopy(model.state_dict())
+                bestOpt = copy.deepcopy(opt.state_dict())
                     
-        print('epoch:{}, train_loss: {:+.3f}, val_loss: {:+.3f}, \ntrain_vector: {}, \nval_vector  : {}\n'.format(epoch,train_loss/i,val_loss,\
-                                                            '|'.join(['%+.2f'%i for i in train_loss_perType/i]),\
-                                                            '|'.join(['%+.2f'%i for i in val_loss_perType])))
+        print('epoch:{}, train_loss: {:+.3f}, val_loss: {:+.3f}\n'.format(epoch,train_loss,val_loss))
         if scheduler is not None:
             scheduler.step(val_loss)
                 
         # early stop
-        if np.any(val_loss_perType==lossBest):
+        if val_loss==lossBest:
             counter = 0
         else:
             counter+= 1
             if counter >= patience:
                 print('----early stop at epoch {}----'.format(epoch))
+                time_elapsed = time.time() - since
+                print('Training completed in {}s'.format(time_elapsed))
                 return model,bestOpt,bestWeight
             
     time_elapsed = time.time() - since
     print('Training completed in {}s'.format(time_elapsed))
     return model,bestOpt,bestWeight 
 
-for j in range(8):
-    print('model:{}'.format(j))
-    model = EfficientNet.from_name('efficientnet-b'+str(j))
-    for arg in model._blocks_args:
-        print(arg.expand_ratio)
+# for j in range(8):
+#     print('model:{}'.format(j))
+#     model = EfficientNet.from_name('efficientnet-b'+str(j))
+#     for arg in model._blocks_args:
+# print(arg.expand_ratio)
