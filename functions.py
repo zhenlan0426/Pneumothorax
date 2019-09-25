@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset
 from torch.nn.utils import clip_grad_value_
+from pytorch_util import set_requires_grad
 import numpy as np
 import time
 import copy
@@ -19,6 +20,7 @@ from efficientnet_pytorch import EfficientNet
 from efficientnet_pytorch.utils import relu_fn,load_pretrained_weights,get_model_params,drop_connect,get_same_padding_conv2d
 from segmentation_models_pytorch.utils.losses import BCEDiceLoss
 from apex import amp
+import cv2
 
 '''------------------------------------------------------------------------------------------------------------------'''
 '''------------------------------------------------------ Data -----------------------------------------------------'''
@@ -143,13 +145,14 @@ class EfficientNet_encoder(EfficientNet):
     differs from EfficientNet in that forward outputs a list of tensors for Unet and does not have fc
     
     """
-    def __init__(self, blocks_args=None, global_params=None):
+    def __init__(self, blocks_args=None, global_params=None,includeX0=False):
         super().__init__(blocks_args,global_params)
         # delete linear layer
         del self._dropout
         del self._fc
         del self._bn1
         del self._conv_head
+        self.includeX0 = includeX0
         self._special_layers()
         
     def _special_layers(self):
@@ -159,7 +162,7 @@ class EfficientNet_encoder(EfficientNet):
         """ return a list of tensor each half in size as previous one
             e.g. (5,16,128,128) -> (5,24,64,64)...
         """
-        x_list = []
+        x_list = [inputs if self.includeX0 else None]
         x = relu_fn(self._bn0(self._conv_stem(inputs)))
         for idx, block in enumerate(self._blocks):
             if idx in self._layers:
@@ -173,14 +176,14 @@ class EfficientNet_encoder(EfficientNet):
         return x_list 
 
     @classmethod
-    def from_name(cls, model_name, override_params=None):
+    def from_name(cls, model_name, override_params=None,**kways):
         cls._check_model_name_is_valid(model_name)
         blocks_args, global_params = get_model_params(model_name, override_params)
-        return EfficientNet_encoder(blocks_args, global_params)
+        return EfficientNet_encoder(blocks_args, global_params,**kways)
 
     @classmethod
-    def from_pretrained(cls, model_name, override_params=None):
-        model = EfficientNet_encoder.from_name(model_name,override_params)
+    def from_pretrained(cls, model_name, override_params=None,**kways):
+        model = EfficientNet_encoder.from_name(model_name,override_params,**kways)
         load_pretrained_weights(model, model_name, load_fc=False)
         return model
 
@@ -322,7 +325,7 @@ class EfficientNet_decoder(nn.Module):
         x = self.layer2([x, skips[1]])
         x = self.layer3([x, skips[2]])
         x = self.layer4([x, skips[3]])
-        x = self.layer5([x, None])
+        x = self.layer5([x, skips[4]])
         x = self.final_conv(x)
         return x
 
@@ -366,18 +369,81 @@ class Unet(nn.Module):
 '''----------------------------------------------------- utility -----------------------------------------------------'''
 '''------------------------------------------------------------------------------------------------------------------'''
 
+def run_length_decode(rle, height=1024, width=1024, fill_value=1):
+    component = np.zeros((height, width), np.float32)
+    component = component.reshape(-1)
+    rle = np.array([int(s) for s in rle.strip().split(' ')])
+    rle = rle.reshape(-1, 2)
+    start = 0
+    for index, length in rle:
+        start = start+index
+        end = start+length
+        component[start: end] = fill_value
+        start = end
+    component = component.reshape(width, height).T
+    return component
+
+def run_length_encode(component):
+    component = component.T.flatten()
+    start = np.where(component[1:] > component[:-1])[0]+1
+    end = np.where(component[:-1] > component[1:])[0]+1
+    length = end-start
+    rle = []
+    for i in range(len(length)):
+        if i == 0:
+            rle.extend([start[0], length[0]])
+        else:
+            rle.extend([start[i]-end[i-1], length[i]])
+    rle = ' '.join([str(r) for r in rle])
+    return rle
+
+def predict(model,loader):
+    model.eval()
+    yhat_list = []
+    with torch.no_grad():
+        for data in loader:
+            data = [out.to('cuda:0') for out in data]
+            yhat_list.append(model.predict(*data).cpu().detach().numpy())
+    yhat = np.concatenate(yhat_list)
+    return yhat.squeeze()
+
+def post_process(probability, threshold, min_size):
+    mask = cv2.threshold(probability, threshold, 1, cv2.THRESH_BINARY)[1]
+    num_component, component = cv2.connectedComponents(mask.astype(np.uint8))
+    predictions = np.zeros_like(probability)
+    num = 0
+    for c in range(1, num_component):
+        p = (component == c)
+        if p.sum() > min_size:
+            predictions[p] = 1
+            num += 1
+    return predictions, num
+
+def submit(df,yhat,best_threshold, min_size,name):
+    encoded_pixels = []
+    for probability in yhat:
+        if probability.shape != (1024, 1024):
+            probability = cv2.resize(probability, dsize=(1024, 1024), interpolation=cv2.INTER_LINEAR)
+        predict, num_predict = post_process(probability, best_threshold, min_size)    
+        if num_predict == 0:
+            encoded_pixels.append('-1')
+        else:
+            r = run_length_encode(predict)
+            encoded_pixels.append(r)
+    df['EncodedPixels'] = encoded_pixels
+    df.to_csv(name, columns=['ImageId', 'EncodedPixels'], index=False)
+    
 def visualize(image,mask):
     plt.imshow(image)
     plt.imshow(mask,alpha=0.5)
 
 def train(opt,model,epochs,train_dl,val_dl,paras,clip,\
-          scheduler=None,patience=6,saveModelEpoch=20):
+          scheduler=None,patience=6,saveModelEpoch=9):
     # add early stop for 5 fold
     since = time.time()
     counter = 0 
     lossBest = 1e6
-    bestWeight = None
-    bestOpt = None
+    bestWeight,bestOpt,bestAmp = [None]*3
         
     opt.zero_grad()
     for epoch in range(epochs):
@@ -412,7 +478,8 @@ def train(opt,model,epochs,train_dl,val_dl,paras,clip,\
             if epoch>saveModelEpoch:
                 bestWeight = copy.deepcopy(model.state_dict())
                 bestOpt = copy.deepcopy(opt.state_dict())
-                    
+                bestAmp = copy.deepcopy(amp.state_dict())
+                
         print('epoch:{}, train_loss: {:+.3f}, val_loss: {:+.3f}\n'.format(epoch,train_loss,val_loss))
         if scheduler is not None:
             scheduler.step(val_loss)
@@ -426,11 +493,11 @@ def train(opt,model,epochs,train_dl,val_dl,paras,clip,\
                 print('----early stop at epoch {}----'.format(epoch))
                 time_elapsed = time.time() - since
                 print('Training completed in {}s'.format(time_elapsed))
-                return model,bestOpt,bestWeight
+                return model,bestWeight,bestOpt,bestAmp
             
     time_elapsed = time.time() - since
     print('Training completed in {}s'.format(time_elapsed))
-    return model,bestOpt,bestWeight 
+    return model,bestWeight,bestOpt,bestAmp
 
 # for j in range(8):
 #     print('model:{}'.format(j))
