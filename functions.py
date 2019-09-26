@@ -437,8 +437,47 @@ def visualize(image,mask):
     plt.imshow(image)
     plt.imshow(mask,alpha=0.5)
 
+def post_process_list(probability, threshold, min_size_list):
+    # min_size is a list of min_size, returns a list of prediction, one for each min_size
+    mask = cv2.threshold(probability, threshold, 1, cv2.THRESH_BINARY)[1]
+    num_component, component = cv2.connectedComponents(mask.astype(np.uint8))
+    prediction_list = [np.zeros_like(probability) for _ in range(len(min_size_list))]
+    for c in range(1, num_component):
+        p = (component == c)
+        p_sum = p.sum()
+        for min_size,predictions in zip(min_size_list,prediction_list):
+            if p_sum > min_size:
+                predictions[p] = 1
+    return prediction_list
+
+def GridSearch(threshold_list,min_size_list,y_val,imageId_val):
+    n = len(y_val)
+    loss_threshold_min_size = []
+    for threshold in threshold_list:
+        loss_min_size = [0]*len(min_size_list)
+        for y_,mask_ in zip(y_val,(np.load("../Data/pickles_1024/images/"+imageId+'.npy') for imageId in imageId_val)):
+            prediction_list = post_process_list(y_,threshold,min_size_list)
+            for i,predict in enumerate(prediction_list):
+                loss_min_size[i] = loss_min_size[i] + dice(predict,mask_) 
+        loss_min_size = [i/n for i in loss_min_size]
+        loss_threshold_min_size.append(loss_min_size)
+    return np.array(loss_threshold_min_size)
+
+def dice(im1, im2):
+    # im1 is predict, im2 is actual
+    im1 = im1.astype(np.bool)
+    im2 = im2.astype(np.bool)
+    im1_sum,im2_sum = im1.sum(),im2.sum()
+    if im2_sum == 0:
+        if im1_sum == 0:
+            return 1
+        else:
+            return 0
+    intersection = np.logical_and(im1, im2)
+    return 2. * intersection.sum() / (im1_sum+im2_sum)
+
 def train(opt,model,epochs,train_dl,val_dl,paras,clip,\
-          scheduler=None,patience=6,saveModelEpoch=9):
+          scheduler=None,patience=6):
     # add early stop for 5 fold
     since = time.time()
     counter = 0 
@@ -475,10 +514,9 @@ def train(opt,model,epochs,train_dl,val_dl,paras,clip,\
         # save model
         if val_loss<lossBest:
             lossBest = val_loss
-            if epoch>saveModelEpoch:
-                bestWeight = copy.deepcopy(model.state_dict())
-                bestOpt = copy.deepcopy(opt.state_dict())
-                bestAmp = copy.deepcopy(amp.state_dict())
+            bestWeight = copy.deepcopy(model.state_dict())
+            bestOpt = copy.deepcopy(opt.state_dict())
+            bestAmp = copy.deepcopy(amp.state_dict())
                 
         print('epoch:{}, train_loss: {:+.3f}, val_loss: {:+.3f}\n'.format(epoch,train_loss,val_loss))
         if scheduler is not None:
