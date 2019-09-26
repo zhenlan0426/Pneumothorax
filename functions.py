@@ -9,9 +9,9 @@ import albumentations as albu
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset,DataLoader
 from torch.nn.utils import clip_grad_value_
-from pytorch_util import set_requires_grad
+#from pytorch_util import set_requires_grad
 import numpy as np
 import time
 import copy
@@ -78,14 +78,15 @@ encoder_channels={'efficientnet-b0': [320, 112, 40, 24, 16],
 #         return self.images.shape[0]
 
 class dataset(Dataset):
-    def __init__(self, imageId,images_dir,masks_dir=None,augmentation=None,preprocessing=None):
+    def __init__(self, imageId,images_dir,masks_dir=None,augmentation=None,preprocessing=None,returnClass=False):
         # preprocessing should be a tuple (mean,std) used to normalize image
         self.imageId = imageId
         self.images_dir = images_dir
         self.masks_dir = masks_dir
         self.augmentation = augmentation
         self.preprocessing = preprocessing
-    
+        self.returnClass = returnClass
+        
     def _cal_preprocessing(self):
         n = len(self)
         mean,std = 0,0
@@ -110,7 +111,10 @@ class dataset(Dataset):
             # apply preprocessing
             if self.preprocessing:
                 image = (image-self.preprocessing[0])/self.preprocessing[1]
-            return image[None], mask[None]
+                if self.returnClass:
+                    return image[None], mask[None], np.mean(mask)
+                else:
+                    return image[None], mask[None]
         else:
             # apply augmentations
             if self.augmentation:            
@@ -135,7 +139,9 @@ transform = albu.Compose([albu.HorizontalFlip(),
                                       albu.OpticalDistortion(distort_limit=2, shift_limit=0.5),
                                       ], p=0.15),
                           albu.ShiftScaleRotate()])
-    
+
+transform_test = albu.HorizontalFlip(always_apply=True)
+
 '''------------------------------------------------------------------------------------------------------------------'''
 '''----------------------------------------------------- Model -----------------------------------------------------'''
 '''------------------------------------------------------------------------------------------------------------------'''
@@ -331,11 +337,21 @@ class EfficientNet_decoder(nn.Module):
 
 
 class Unet(nn.Module):
-    def __init__(self, encoder, decoder,activation='sigmoid'):
+    def __init__(self, encoder, decoder,activation='sigmoid',mask_loss=BCEDiceLoss(activation='sigmoid'),classLoss=None,last_d=None):
+        # F.binary_cross_entropy_with_logits
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
-        self.loss = BCEDiceLoss(activation=activation)
+        self.mask_loss = mask_loss
+        self.classLoss = classLoss
+        if classLoss is not None:
+            self.pool = nn.AdaptiveAvgPool2d(1)
+            self.head = nn.Sequential(nn.BatchNorm1d(last_d),\
+                                      nn.Linear(last_d,last_d*2),\
+                                      nn.ReLU(inplace=True),
+                                      nn.BatchNorm1d(last_d*2),\
+                                      nn.Linear(last_d*2,1),\
+                                      )
         
         if callable(activation):
             self.activation = activation
@@ -346,12 +362,19 @@ class Unet(nn.Module):
         else:
             raise ValueError('Activation should be "sigmoid" or "softmax"')
             
-    def forward(self,x,mask=None):
+    def forward(self,x,mask=None,classLabel=None,maskWeight=1):
         x = x.expand(-1,3,-1,-1) # gray to RGB
         x = self.encoder(x)
+        if classLabel is not None:
+            class_pred = self.pool(x[-1]).squeeze()
+            class_pred = self.head(class_pred).squeeze()
+            
         x = self.decoder(x)
         if mask is not None:
-            return self.loss(x,mask)
+            if classLabel is None:
+                return self.mask_loss(x,mask)
+            else:
+                return self.mask_loss(x,mask) * maskWeight + self.classLoss(class_pred,classLabel)
         else:
             return x
 
@@ -407,6 +430,18 @@ def predict(model,loader):
     yhat = np.concatenate(yhat_list)
     return yhat.squeeze()
 
+def predict_TTA(model,ImageId,images_dir,preprocessing,batch_size):
+    loader1 = dataset(ImageId,images_dir,preprocessing=preprocessing)
+    loader1 = DataLoader(loader1, batch_size=batch_size, shuffle=False, num_workers=4)
+    loader2 = dataset(ImageId,images_dir,preprocessing=preprocessing,augmentation=transform_test)
+    loader2 = DataLoader(loader2, batch_size=batch_size, shuffle=False, num_workers=4)    
+    yhat1 = predict(model,loader1)
+    yhat2 = predict(model,loader2)
+    _transform = lambda x:transform_test(image=x)['image']
+    for i,y_ in enumerate(yhat2):
+        yhat2[i] = _transform(y_)
+    return (yhat1 + yhat2)/2
+
 def post_process(probability, threshold, min_size):
     mask = cv2.threshold(probability, threshold, 1, cv2.THRESH_BINARY)[1]
     num_component, component = cv2.connectedComponents(mask.astype(np.uint8))
@@ -455,7 +490,7 @@ def GridSearch(threshold_list,min_size_list,y_val,imageId_val):
     loss_threshold_min_size = []
     for threshold in threshold_list:
         loss_min_size = [0]*len(min_size_list)
-        for y_,mask_ in zip(y_val,(np.load("../Data/pickles_1024/images/"+imageId+'.npy') for imageId in imageId_val)):
+        for y_,mask_ in zip(y_val,(np.load("../Data/pickles_1024/masks/"+imageId+'.npy') for imageId in imageId_val)):
             prediction_list = post_process_list(y_,threshold,min_size_list)
             for i,predict in enumerate(prediction_list):
                 loss_min_size[i] = loss_min_size[i] + dice(predict,mask_) 
